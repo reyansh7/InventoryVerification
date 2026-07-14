@@ -1,0 +1,47 @@
+# Python / Environment
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Node
+node_modules/
+dist/
+build/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database & Uploads
+*.sqlite3
+*.db
+inventory.db
+uploads/
+
+# YOLO & Machine Learning Artifacts
+*.pt
+!*yolo11n.pt  # keep nano model if needed, otherwise ignore all
+runs/
+autotrain_dataset/
+new_dataset_boxes/
+new_dataset_pallets/
+train/
+test/
+valid/
+*.cache
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Other temp scripts
+run_train_on_saved_labels.py
