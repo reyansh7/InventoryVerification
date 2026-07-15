@@ -61,12 +61,55 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS erp_data (
-            object_code TEXT PRIMARY KEY,
-            expected_qty INTEGER
-        )
-    ''')
+    
+    # Check if csv_files exists. If not, this is the migration point.
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='csv_files'")
+    if not c.fetchone():
+        c.execute('''
+            CREATE TABLE csv_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Insert a dummy record for existing data
+        c.execute("INSERT INTO csv_files (filename) VALUES ('Legacy_ERP.csv')")
+        legacy_id = c.lastrowid
+        
+        # Check if old erp_data exists
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='erp_data'")
+        if c.fetchone():
+            c.execute('ALTER TABLE erp_data RENAME TO erp_data_old')
+            c.execute('''
+                CREATE TABLE erp_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    csv_id INTEGER,
+                    object_code TEXT,
+                    expected_qty INTEGER
+                )
+            ''')
+            c.execute(f'INSERT INTO erp_data (csv_id, object_code, expected_qty) SELECT {legacy_id}, object_code, expected_qty FROM erp_data_old')
+            c.execute('DROP TABLE erp_data_old')
+        else:
+            c.execute('''
+                CREATE TABLE erp_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    csv_id INTEGER,
+                    object_code TEXT,
+                    expected_qty INTEGER
+                )
+            ''')
+    else:
+        # Table exists, ensure erp_data does too just in case
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS erp_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                csv_id INTEGER,
+                object_code TEXT,
+                expected_qty INTEGER
+            )
+        ''')
+
     # Add file_path if it doesn't exist (for existing DB)
     try:
         c.execute('ALTER TABLE scans ADD COLUMN file_path TEXT')
@@ -208,8 +251,10 @@ def delete_class(object_code: str):
 async def upload_erp(file: UploadFile = File(...)):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('CREATE TABLE IF NOT EXISTS erp_data (object_code TEXT PRIMARY KEY, expected_qty INTEGER)')
-    c.execute('DELETE FROM erp_data')
+    
+    filename = file.filename or "uploaded.csv"
+    c.execute('INSERT INTO csv_files (filename) VALUES (?)', (filename,))
+    csv_id = c.lastrowid
     
     contents = await file.read()
     reader = csv.DictReader(codecs.iterdecode(io.BytesIO(contents), 'utf-8'))
@@ -228,8 +273,71 @@ async def upload_erp(file: UploadFile = File(...)):
                 except:
                     pass
         if sku:
-            c.execute('INSERT OR REPLACE INTO erp_data (object_code, expected_qty) VALUES (?, ?)', (sku, qty))
+            c.execute('INSERT INTO erp_data (csv_id, object_code, expected_qty) VALUES (?, ?, ?)', (csv_id, sku, qty))
     
+    conn.commit()
+    conn.close()
+    return {"status": "success", "csv_id": csv_id}
+
+@app.get("/erp/files")
+def get_erp_files():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM csv_files ORDER BY uploaded_at DESC')
+    files = [dict(row) for row in c.fetchall()]
+    
+    for file in files:
+        c.execute('SELECT object_code, expected_qty FROM erp_data WHERE csv_id = ?', (file['id'],))
+        file['items'] = [dict(row) for row in c.fetchall()]
+        
+    conn.close()
+    return files
+
+class AddErpItemRequest(BaseModel):
+    object_code: str
+    expected_qty: int = 0
+
+@app.post("/erp/files/{csv_id}/items")
+def add_erp_item(csv_id: int, req: AddErpItemRequest):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM erp_data WHERE object_code = ?', (req.object_code,))
+    c.execute('INSERT INTO erp_data (csv_id, object_code, expected_qty) VALUES (?, ?, ?)', 
+              (csv_id, req.object_code, req.expected_qty))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.delete("/erp/files/{csv_id}/items/{object_code}")
+def delete_erp_item(csv_id: int, object_code: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM erp_data WHERE csv_id = ? AND object_code = ?', (csv_id, object_code))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.delete("/erp/files/{csv_id}")
+def delete_erp_file(csv_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM erp_data WHERE csv_id = ?', (csv_id,))
+    c.execute('DELETE FROM csv_files WHERE id = ?', (csv_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+class MergeRequest(BaseModel):
+    source_object_code: str
+    target_object_code: str
+
+@app.patch("/inventory/merge")
+def merge_inventory_class(req: MergeRequest):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('UPDATE scans SET object_code = ? WHERE object_code = ?', 
+              (req.target_object_code, req.source_object_code))
     conn.commit()
     conn.close()
     return {"status": "success"}
@@ -373,12 +481,13 @@ def background_training_task(scan_ids: List[int], api_keys: List[str] = None):
                 time.sleep(6)
                 
             prompt = (
-                "You are a warehouse inventory AI. Carefully detect ALL cardboard boxes "
-                "and wooden pallets visible in this image, including partially visible ones.\n"
+                "You are a warehouse inventory AI. Carefully detect ALL inventory items "
+                "(including cardboard boxes, wooden pallets, stacked white bales, and bundles of paper) "
+                "visible in this image, including partially visible ones.\n"
                 "Return ONLY a JSON object with this exact structure:\n"
                 '{"detections": [{"label": "box", "xmin": 120, "ymin": 80, "xmax": 450, "ymax": 390}]}\n'
                 "Rules:\n"
-                "- label must be exactly 'box' or 'pallet' (lowercase)\n"
+                "- label must be exactly 'box' or 'pallet' (lowercase). Treat ANY stackable inventory items (bales, paper bundles, crates, etc.) as 'box'.\n"
                 "- coordinates are integers 0-1000, where (0,0) is top-left and (1000,1000) is bottom-right\n"
                 "- xmax must be greater than xmin, ymax must be greater than ymin\n"
                 "- Return empty detections array if nothing is found\n"

@@ -31,15 +31,21 @@ interface InventoryRecord {
   expected_qty?: number;
 }
 
+interface ERPFile {
+  id: number;
+  filename: string;
+  uploaded_at: string;
+  items: { object_code: string; expected_qty: number }[];
+}
+
 function App() {
   const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
   const [objectCode, setObjectCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [inventory, setInventory] = useState<InventoryRecord[]>([]);
-  const [geminiApiKey, setGeminiApiKey] = useState(localStorage.getItem("geminiApiKey") || "");
-  const [geminiApiKey2, setGeminiApiKey2] = useState(localStorage.getItem("geminiApiKey2") || "");
-  const [geminiApiKey3, setGeminiApiKey3] = useState(localStorage.getItem("geminiApiKey3") || "");
+  const [erpFiles, setErpFiles] = useState<ERPFile[]>([]);
+
   const [trainingScanId, setTrainingScanId] = useState<number | null>(null);
   const [trainingStatus, setTrainingStatus] = useState<{
     running: boolean; phase: string; total: number; labeled: number; failed: number; message: string;
@@ -69,20 +75,7 @@ function App() {
     return () => { if (interval) clearInterval(interval); };
   }, [trainingStatus?.running]);
   
-  const handleSaveApiKey = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setGeminiApiKey(e.target.value);
-    localStorage.setItem("geminiApiKey", e.target.value);
-  };
 
-  const handleSaveApiKey2 = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setGeminiApiKey2(e.target.value);
-    localStorage.setItem("geminiApiKey2", e.target.value);
-  };
-
-  const handleSaveApiKey3 = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setGeminiApiKey3(e.target.value);
-    localStorage.setItem("geminiApiKey3", e.target.value);
-  };
 
   const handleExportCsv = () => {
     if (inventory.length === 0) {
@@ -119,10 +112,7 @@ function App() {
   };
 
   const handleAutoTrain = async (item: MediaItem) => {
-    if (!geminiApiKey) {
-      alert("Please enter your Gemini API Key in the top right first!");
-      return;
-    }
+
     if (!item.scan_id) {
       alert("This item hasn't been saved to the database yet.");
       return;
@@ -136,11 +126,10 @@ function App() {
     setTrainingStatus({ running: true, phase: 'starting', total: 1, labeled: 0, failed: 0, message: 'Starting...' });
     
     try {
-      const apiKeys = [geminiApiKey, geminiApiKey2, geminiApiKey3].filter(Boolean);
       const res = await fetch(`${API_URL}/autotrain`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scan_ids: [item.scan_id], api_keys: apiKeys })
+        body: JSON.stringify({ scan_ids: [item.scan_id], api_keys: [] })
       });
       const data = await res.json();
       if (data.status === 'busy') {
@@ -161,10 +150,7 @@ function App() {
       alert("No completed scans available for training.");
       return;
     }
-    if (!geminiApiKey) {
-      alert("Please enter your Gemini API Key in the top right first!");
-      return;
-    }
+
     if (trainingStatus?.running) {
       alert("A training job is already running. Please wait for it to finish.");
       return;
@@ -173,11 +159,10 @@ function App() {
     setTrainingStatus({ running: true, phase: 'starting', total: scansToTrain.length, labeled: 0, failed: 0, message: `Starting autotrain for ${scansToTrain.length} scan(s)...` });
     
     try {
-      const apiKeys = [geminiApiKey, geminiApiKey2, geminiApiKey3].filter(Boolean);
       const res = await fetch(`${API_URL}/autotrain`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scan_ids: scansToTrain, api_keys: apiKeys })
+        body: JSON.stringify({ scan_ids: scansToTrain, api_keys: [] })
       });
       const data = await res.json();
       if (data.status === 'busy') {
@@ -193,20 +178,35 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const erpInputRef = useRef<HTMLInputElement>(null);
 
+  const fetchErpFiles = async () => {
+    try {
+      const res = await fetch(`${API_URL}/erp/files`);
+      if (res.ok) {
+        setErpFiles(await res.json());
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const fetchInventory = async () => {
     try {
+      fetchErpFiles();
       const res = await fetch(`${API_URL}/inventory`);
       if (res.ok) {
         const data = await res.json();
         setInventory(data);
       }
-    } catch (e) {
-      console.error('Failed to fetch inventory', e);
+    } catch (err) {
+      console.error(err);
+      setGlobalError('Failed to fetch inventory. Backend might be down.');
     }
   };
 
   useEffect(() => {
     fetchInventory();
+    const interval = setInterval(fetchInventory, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const fetchObjectScans = async (code: string) => {
@@ -261,6 +261,74 @@ function App() {
     } catch (e) {
       console.error(e);
       setGlobalError(`Failed to delete class '${code}'.`);
+    }
+  };
+
+  const handleDeleteErpFile = async (id: number) => {
+    if (!confirm("Are you sure you want to delete this CSV? This will remove all expected quantities associated with it.")) return;
+    try {
+      await fetch(`${API_URL}/erp/files/${id}`, { method: 'DELETE' });
+      fetchInventory();
+    } catch (e) {
+      console.error(e);
+      setGlobalError("Failed to delete CSV.");
+    }
+  };
+
+  const handleDeleteErpItem = async (csvId: number, objectCode: string) => {
+    if (!confirm(`Are you sure you want to remove '${objectCode}' from this CSV?`)) return;
+    try {
+      await fetch(`${API_URL}/erp/files/${csvId}/items/${objectCode}`, { method: 'DELETE' });
+      fetchInventory();
+    } catch (e) {
+      console.error(e);
+      setGlobalError("Failed to remove item from CSV.");
+    }
+  };
+
+  const handleDragStartItem = (e: React.DragEvent, sourceCode: string) => {
+    e.dataTransfer.setData('text/plain', sourceCode);
+  };
+
+  const handleDropOnSku = async (e: React.DragEvent, targetCode: string) => {
+    e.preventDefault();
+    const sourceCode = e.dataTransfer.getData('text/plain');
+    if (sourceCode && sourceCode !== targetCode) {
+      if (confirm(`Merge all scans from '${sourceCode}' into '${targetCode}'?`)) {
+        try {
+          await fetch(`${API_URL}/inventory/merge`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_object_code: sourceCode, target_object_code: targetCode })
+          });
+          fetchInventory();
+        } catch(err) {
+          console.error(err);
+        }
+      }
+    }
+  };
+
+  const handleDragOverSku = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+
+  const handleDropOnCsv = async (e: React.DragEvent, csvId: number, csvFilename: string) => {
+    e.preventDefault();
+    const sourceCode = e.dataTransfer.getData('text/plain');
+    if (sourceCode) {
+      if (confirm(`Link class '${sourceCode}' to the ERP file '${csvFilename}'?`)) {
+        try {
+          await fetch(`${API_URL}/erp/files/${csvId}/items`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ object_code: sourceCode, expected_qty: 0 })
+          });
+          fetchInventory();
+        } catch(err) {
+          console.error(err);
+        }
+      }
     }
   };
 
@@ -651,6 +719,90 @@ function App() {
     );
   };
 
+  const renderInventoryRecord = (record: InventoryRecord, fromCsvId?: number) => {
+    const isVerified = record.expected_qty !== undefined && record.expected_qty !== null;
+    const actualQty = record.total_boxes || 0;
+    const expectedQty = record.expected_qty || 0;
+    const diff = actualQty - expectedQty;
+    
+    let statusColor = '#9ca3af';
+    let statusText = '';
+    
+    if (isVerified) {
+      if (diff === 0) {
+        statusColor = '#4ade80';
+        statusText = 'OK';
+      } else if (diff < 0) {
+        statusColor = '#f87171';
+        statusText = `Missing ${Math.abs(diff)}`;
+      } else {
+        statusColor = '#facc15';
+        statusText = `Surplus ${diff}`;
+      }
+    }
+
+    return (
+      <div 
+        key={record.object_code} 
+        draggable={true}
+        onDragStart={(e) => handleDragStartItem(e, record.object_code)}
+        onClick={() => fetchObjectScans(record.object_code)}
+        style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '8px', padding: '16px', borderLeft: `4px solid ${isVerified ? statusColor : '#60a5fa'}`, cursor: 'grab', transition: 'background 0.2s', marginBottom: '12px' }}
+        onMouseOver={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
+        onMouseOut={(e) => e.currentTarget.style.background = 'rgba(0,0,0,0.3)'}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+          <h3 style={{ margin: 0, color: 'white', fontSize: '18px' }}>{record.object_code}</h3>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {isVerified ? (
+              <span style={{ fontSize: '12px', fontWeight: 'bold', color: statusColor, background: 'rgba(255,255,255,0.05)', padding: '4px 8px', borderRadius: '4px' }}>
+                {statusText}
+              </span>
+            ) : (
+              <span style={{ fontSize: '12px', color: '#9ca3af' }}>{record.scan_count} scan(s)</span>
+            )}
+            
+            {fromCsvId ? (
+              <button 
+                onClick={(e) => { e.stopPropagation(); handleDeleteErpItem(fromCsvId, record.object_code); }}
+                style={{ background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer', padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                title={`Remove ${record.object_code} from CSV`}
+              >
+                <Trash2 size={16} />
+              </button>
+            ) : (
+              <button 
+                onClick={(e) => { e.stopPropagation(); handleDeleteClass(e, record.object_code); }}
+                style={{ background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer', padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                title={`Delete ${record.object_code}`}
+              >
+                <Trash2 size={16} />
+              </button>
+            )}
+          </div>
+        </div>
+        
+        <div style={{ display: 'flex', gap: '16px', marginBottom: isVerified ? '12px' : '0' }}>
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Box size={16} className="box-icon" /> 
+            <span style={{ color: 'white', fontWeight: 'bold' }}>{actualQty}</span>
+          </div>
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Layers size={16} className="pallet-icon" /> 
+            <span style={{ color: 'white', fontWeight: 'bold' }}>{record.total_pallets || 0}</span>
+          </div>
+        </div>
+        
+        {isVerified && (
+          <div style={{ fontSize: '13px', color: '#9ca3af', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '8px', display: 'flex', justifyContent: 'space-between' }}>
+            <span>ERP Expected Qty: <strong style={{ color: 'white' }}>{expectedQty}</strong></span>
+            {record.scan_count > 0 && <span>({record.scan_count} Scans)</span>}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="app-container">
       <div className="background-glow glow-1"></div>
@@ -665,30 +817,7 @@ function App() {
             </div>
             <p className="subtitle">Warehouse Scanning System</p>
           </div>
-          <div style={{ background: 'rgba(0,0,0,0.4)', padding: '12px 16px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ display: 'block', fontSize: '12px', color: '#9ca3af', marginBottom: '-4px' }}>Gemini API Keys (Auto-Training)</label>
-            <input 
-              type="password" 
-              value={geminiApiKey} 
-              onChange={handleSaveApiKey} 
-              placeholder="Primary API Key..."
-              style={{ width: '250px', padding: '8px', borderRadius: '4px', background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.2)', color: 'white', fontSize: '13px' }} 
-            />
-            <input 
-              type="password" 
-              value={geminiApiKey2} 
-              onChange={handleSaveApiKey2} 
-              placeholder="Secondary API Key (optional)..."
-              style={{ width: '250px', padding: '8px', borderRadius: '4px', background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.2)', color: 'white', fontSize: '13px' }} 
-            />
-            <input 
-              type="password" 
-              value={geminiApiKey3} 
-              onChange={handleSaveApiKey3} 
-              placeholder="Tertiary API Key (optional)..."
-              style={{ width: '250px', padding: '8px', borderRadius: '4px', background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.2)', color: 'white', fontSize: '13px' }} 
-            />
-          </div>
+
         </header>
 
         {globalError && (
@@ -857,83 +986,56 @@ function App() {
                 </div>
               </div>
 
+              {/* Uploaded ERP Files Section */}
+              {erpFiles.length > 0 && (
+                <div style={{ marginBottom: '32px' }}>
+                  <h3 style={{ color: 'white', marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <FileSpreadsheet size={20} /> Uploaded ERP Files
+                  </h3>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                    {erpFiles.map(file => (
+                      <div 
+                        key={file.id} 
+                        className="glass-card" 
+                        onDrop={(e) => handleDropOnCsv(e, file.id, file.filename)}
+                        onDragOver={handleDragOverSku}
+                        style={{ padding: '16px', background: 'rgba(59,130,246,0.05)', border: '1px solid rgba(59,130,246,0.2)' }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: file.items.length > 0 ? '12px' : '0', borderBottom: file.items.length > 0 ? '1px solid rgba(255,255,255,0.1)' : 'none', paddingBottom: file.items.length > 0 ? '12px' : '0' }}>
+                          <span style={{ color: 'white', fontWeight: 'bold' }}>{file.filename}</span>
+                          <button onClick={() => handleDeleteErpFile(file.id)} style={{ padding: '4px', background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer' }}>
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: '400px', overflowY: 'auto', paddingRight: '4px' }}>
+                          {file.items.map(item => {
+                            const invRec = inventory.find(i => i.object_code === item.object_code) || {
+                              object_code: item.object_code,
+                              total_boxes: 0,
+                              total_pallets: 0,
+                              scan_count: 0,
+                              expected_qty: item.expected_qty
+                            };
+                            return renderInventoryRecord(invRec, file.id);
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {inventory.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '40px 0', color: '#9ca3af' }}>
                   <p>No inventory records found.</p>
                   <p style={{ fontSize: '13px' }}>Upload an ERP CSV or scan objects to build your database.</p>
                 </div>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                  {inventory.map(record => {
-                    const isVerified = record.expected_qty !== undefined && record.expected_qty !== null;
-                    const actualQty = record.total_boxes || 0;
-                    const expectedQty = record.expected_qty || 0;
-                    const diff = actualQty - expectedQty;
-                    
-                    let statusColor = '#9ca3af';
-                    let statusText = '';
-                    
-                    if (isVerified) {
-                      if (diff === 0) {
-                        statusColor = '#4ade80';
-                        statusText = 'OK';
-                      } else if (diff < 0) {
-                        statusColor = '#f87171';
-                        statusText = `Missing ${Math.abs(diff)}`;
-                      } else {
-                        statusColor = '#facc15';
-                        statusText = `Surplus ${diff}`;
-                      }
-                    }
-
-                    return (
-                      <div 
-                        key={record.object_code} 
-                        onClick={() => fetchObjectScans(record.object_code)}
-                        style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '8px', padding: '16px', borderLeft: `4px solid ${isVerified ? statusColor : '#60a5fa'}`, cursor: 'pointer', transition: 'background 0.2s' }}
-                        onMouseOver={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
-                        onMouseOut={(e) => e.currentTarget.style.background = 'rgba(0,0,0,0.3)'}
-                      >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                          <h3 style={{ margin: 0, color: 'white', fontSize: '18px' }}>{record.object_code}</h3>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            {isVerified ? (
-                              <span style={{ fontSize: '12px', fontWeight: 'bold', color: statusColor, background: 'rgba(255,255,255,0.05)', padding: '4px 8px', borderRadius: '4px' }}>
-                                {statusText}
-                              </span>
-                            ) : (
-                              <span style={{ fontSize: '12px', color: '#9ca3af' }}>{record.scan_count} scan(s)</span>
-                            )}
-                            <button 
-                              onClick={(e) => handleDeleteClass(e, record.object_code)}
-                              style={{ background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer', padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                              title={`Delete ${record.object_code}`}
-                            >
-                              <Trash2 size={16} />
-                            </button>
-                          </div>
-                        </div>
-                        
-                        <div style={{ display: 'flex', gap: '16px', marginBottom: isVerified ? '12px' : '0' }}>
-                          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <Box size={16} className="box-icon" /> 
-                            <span style={{ color: 'white', fontWeight: 'bold' }}>{actualQty}</span>
-                          </div>
-                          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <Layers size={16} className="pallet-icon" /> 
-                            <span style={{ color: 'white', fontWeight: 'bold' }}>{record.total_pallets || 0}</span>
-                          </div>
-                        </div>
-                        
-                        {isVerified && (
-                          <div style={{ fontSize: '13px', color: '#9ca3af', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '8px', display: 'flex', justifyContent: 'space-between' }}>
-                            <span>ERP Expected Qty: <strong style={{ color: 'white' }}>{expectedQty}</strong></span>
-                            {record.scan_count > 0 && <span>({record.scan_count} Scans)</span>}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                <div style={{ display: 'flex', flexDirection: 'column' }}>
+                  {inventory
+                    .filter(record => !erpFiles.some(f => f.items.some(i => i.object_code === record.object_code)))
+                    .map(record => renderInventoryRecord(record))
+                  }
                 </div>
               )}
             </div>
