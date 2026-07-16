@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { UploadCloud, Box, Layers, Loader2, ArrowRight, Database, AlertCircle, Check, X, FileSpreadsheet, Edit3, Trash2, BrainCircuit } from 'lucide-react';
+import { UploadCloud, Box, Layers, Loader2, ArrowRight, Database, AlertCircle, Check, X, FileSpreadsheet, Edit3, Trash2 } from 'lucide-react';
 import './index.css';
 
 const API_URL = "http://localhost:8000";
@@ -46,37 +46,6 @@ function App() {
   const [inventory, setInventory] = useState<InventoryRecord[]>([]);
   const [erpFiles, setErpFiles] = useState<ERPFile[]>([]);
 
-  const [trainingScanId, setTrainingScanId] = useState<number | null>(null);
-  const [trainingStatus, setTrainingStatus] = useState<{
-    running: boolean; phase: string; total: number; labeled: number; failed: number; message: string;
-  } | null>(null);
-  
-  // Poll training status every 3s when a job is running
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval> | null = null;
-    const poll = async () => {
-      try {
-        const res = await fetch(`${API_URL}/autotrain/status`);
-        if (res.ok) {
-          const data = await res.json();
-          setTrainingStatus(data);
-          if (!data.running && interval) {
-            clearInterval(interval);
-            interval = null;
-            // Keep final status visible for 10s then clear
-            setTimeout(() => setTrainingStatus(null), 10000);
-          }
-        }
-      } catch { /* backend not ready yet */ }
-    };
-    if (trainingStatus?.running) {
-      interval = setInterval(poll, 3000);
-    }
-    return () => { if (interval) clearInterval(interval); };
-  }, [trainingStatus?.running]);
-  
-
-
   const handleExportCsv = () => {
     if (inventory.length === 0) {
       alert("No inventory data to export.");
@@ -111,70 +80,6 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleAutoTrain = async (item: MediaItem) => {
-
-    if (!item.scan_id) {
-      alert("This item hasn't been saved to the database yet.");
-      return;
-    }
-    if (trainingStatus?.running) {
-      alert("A training job is already running. Please wait for it to finish.");
-      return;
-    }
-    
-    setTrainingScanId(item.scan_id);
-    setTrainingStatus({ running: true, phase: 'starting', total: 1, labeled: 0, failed: 0, message: 'Starting...' });
-    
-    try {
-      const res = await fetch(`${API_URL}/autotrain`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scan_ids: [item.scan_id], api_keys: [] })
-      });
-      const data = await res.json();
-      if (data.status === 'busy') {
-        alert(data.message);
-        setTrainingStatus(data.training_status);
-      }
-    } catch (e) {
-      console.error(e);
-      setTrainingStatus({ running: false, phase: 'error', total: 1, labeled: 0, failed: 0, message: 'Failed to contact backend.' });
-    } finally {
-      setTimeout(() => setTrainingScanId(null), 5000);
-    }
-  };
-  
-  const handleAutoTrainAll = async () => {
-    const scansToTrain = doneItems.map(item => item.scan_id).filter(id => id !== undefined) as number[];
-    if (scansToTrain.length === 0) {
-      alert("No completed scans available for training.");
-      return;
-    }
-
-    if (trainingStatus?.running) {
-      alert("A training job is already running. Please wait for it to finish.");
-      return;
-    }
-
-    setTrainingStatus({ running: true, phase: 'starting', total: scansToTrain.length, labeled: 0, failed: 0, message: `Starting autotrain for ${scansToTrain.length} scan(s)...` });
-    
-    try {
-      const res = await fetch(`${API_URL}/autotrain`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scan_ids: scansToTrain, api_keys: [] })
-      });
-      const data = await res.json();
-      if (data.status === 'busy') {
-        alert(data.message);
-        setTrainingStatus(data.training_status);
-      }
-    } catch (e) {
-      console.error(e);
-      alert("Failed to start auto-training.");
-    }
-  };
-  
   const fileInputRef = useRef<HTMLInputElement>(null);
   const erpInputRef = useRef<HTMLInputElement>(null);
 
@@ -673,25 +578,13 @@ function App() {
         </div>
 
         {(item.status === 'done' || item.status === 'past_scan' || isDup) && (
-          <div style={{ display: 'flex', gap: '16px', marginTop: '16px', padding: '12px', background: 'rgba(0,0,0,0.3)', borderRadius: '8px', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ display: 'flex', gap: '16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <Box size={18} className="box-icon" /> <span style={{ fontSize: '15px', fontWeight: 'bold', color: 'white' }}>{item.box_count} Boxes</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <Layers size={18} className="pallet-icon" /> <span style={{ fontSize: '15px', fontWeight: 'bold', color: 'white' }}>{item.pallet_count} Pallets</span>
-              </div>
+          <div style={{ display: 'flex', gap: '16px', marginTop: '16px', padding: '12px', background: 'rgba(0,0,0,0.3)', borderRadius: '8px', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Box size={18} className="box-icon" /> <span style={{ fontSize: '15px', fontWeight: 'bold', color: 'white' }}>{item.box_count} Boxes</span>
             </div>
-            
-            <button 
-              className="btn btn-primary" 
-              onClick={() => handleAutoTrain(item)} 
-              disabled={trainingScanId === item.scan_id}
-              style={{ padding: '6px 12px', fontSize: '12px', background: '#3b82f6', display: 'flex', alignItems: 'center', gap: '6px' }}
-            >
-              {trainingScanId === item.scan_id ? <Loader2 size={14} className="spinner" /> : <BrainCircuit size={14}/>}
-              {trainingScanId === item.scan_id ? 'Training...' : 'Auto Train AI'}
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Layers size={18} className="pallet-icon" /> <span style={{ fontSize: '15px', fontWeight: 'bold', color: 'white' }}>{item.pallet_count} Pallets</span>
+            </div>
           </div>
         )}
 
@@ -842,49 +735,6 @@ function App() {
           </div>
         )}
 
-        {trainingStatus && (
-          <div style={{
-            marginBottom: '20px', padding: '16px 20px', borderRadius: '12px',
-            background: trainingStatus.phase === 'done' ? 'rgba(74,222,128,0.1)' :
-                        trainingStatus.phase === 'error' ? 'rgba(239,68,68,0.1)' :
-                        'rgba(59,130,246,0.1)',
-            border: `1px solid ${trainingStatus.phase === 'done' ? 'rgba(74,222,128,0.4)' :
-                                  trainingStatus.phase === 'error' ? 'rgba(239,68,68,0.4)' :
-                                  'rgba(59,130,246,0.4)'}`,
-            display: 'flex', flexDirection: 'column', gap: '8px'
-          }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                {trainingStatus.running && <Loader2 size={16} className="spinner" style={{ color: '#60a5fa' }} />}
-                {trainingStatus.phase === 'done' && <span style={{ fontSize: '16px' }}>✅</span>}
-                {trainingStatus.phase === 'error' && <AlertCircle size={16} style={{ color: '#f87171' }} />}
-                <span style={{ fontWeight: 'bold', color: 'white', fontSize: '14px' }}>
-                  {trainingStatus.running ? `AI Training: ${trainingStatus.phase.charAt(0).toUpperCase() + trainingStatus.phase.slice(1)}` :
-                   trainingStatus.phase === 'done' ? 'Training Complete' : 'Training Failed'}
-                </span>
-              </div>
-              {trainingStatus.phase === 'labeling' && (
-                <span style={{ fontSize: '12px', color: '#9ca3af' }}>
-                  {trainingStatus.labeled}/{trainingStatus.total} labeled · {trainingStatus.failed} skipped
-                </span>
-              )}
-              {!trainingStatus.running && (
-                <button onClick={() => setTrainingStatus(null)} style={{ background: 'transparent', border: 'none', color: '#9ca3af', cursor: 'pointer', fontSize: '16px', padding: '2px 6px' }}>✕</button>
-              )}
-            </div>
-            {trainingStatus.phase === 'labeling' && trainingStatus.total > 0 && (
-              <div style={{ background: 'rgba(0,0,0,0.4)', borderRadius: '4px', height: '6px', overflow: 'hidden' }}>
-                <div style={{
-                  height: '100%', borderRadius: '4px', background: 'linear-gradient(90deg, #3b82f6, #60a5fa)',
-                  width: `${Math.round((trainingStatus.labeled / trainingStatus.total) * 100)}%`,
-                  transition: 'width 0.5s ease'
-                }} />
-              </div>
-            )}
-            <p style={{ margin: 0, fontSize: '13px', color: '#9ca3af' }}>{trainingStatus.message}</p>
-          </div>
-        )}
-
         <div style={{ display: 'flex', gap: '40px', flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 600px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
             <div className="glass-card" style={{ padding: '24px' }}>
@@ -932,11 +782,6 @@ function App() {
                     <div style={{ marginBottom: '20px' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                          <h3 style={{ color: 'white', margin: 0 }}>Active Scans</h3>
-                         {doneItems.length > 0 && (
-                            <button className="btn btn-primary" onClick={handleAutoTrainAll} style={{ padding: '6px 12px', fontSize: '13px', background: '#3b82f6', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <BrainCircuit size={16} /> Train All {doneItems.length} Scans
-                            </button>
-                         )}
                       </div>
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
                         {doneItems.map(item => renderMediaCard(item))}
