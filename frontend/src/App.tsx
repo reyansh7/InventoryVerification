@@ -56,7 +56,7 @@ function App() {
     let interval: ReturnType<typeof setInterval> | null = null;
     const poll = async () => {
       try {
-        const res = await fetch('http://localhost:8000/autotrain/status');
+        const res = await fetch(`${API_URL}/autotrain/status`);
         if (res.ok) {
           const data = await res.json();
           setTrainingStatus(data);
@@ -219,7 +219,7 @@ function App() {
           id: `scan-${scan.id}`,
           previewUrl: scan.file_path ? `${API_URL}/${scan.file_path}` : '',
           annotated_url: scan.file_path ? `${API_URL}/${scan.file_path}` : '',
-          isVideo: scan.file_path ? scan.file_path.endsWith('.mp4') : false,
+          isVideo: scan.file_path ? /\.(mp4|webm|mov|avi)$/i.test(scan.file_path) : false,
           status: 'past_scan' as const,
           box_count: scan.box_count,
           pallet_count: scan.pallet_count,
@@ -319,6 +319,7 @@ function App() {
     if (sourceCode) {
       if (confirm(`Link class '${sourceCode}' to the ERP file '${csvFilename}'?`)) {
         try {
+          // Backend resolves qty from this ERP's uploaded catalog (0 if class not in that ERP)
           await fetch(`${API_URL}/erp/files/${csvId}/items`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -466,9 +467,13 @@ function App() {
             body: formData,
           });
 
-          if (!response.ok) throw new Error(`Failed to analyze video: ${video.file.name}`);
-
           const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || `Failed to analyze video: ${video.file.name}`);
+          }
+          if (data.error) {
+            throw new Error(data.error);
+          }
           
           const isLowQuality = data.is_low_quality;
           const isDuplicate = data.is_duplicate;
@@ -502,7 +507,8 @@ function App() {
           });
         } catch (vidErr) {
           console.error(vidErr);
-          setMediaItems(prev => prev.map(item => item.id === video.id ? { ...item, status: 'error', error: 'Failed' } : item));
+          const message = vidErr instanceof Error ? vidErr.message : 'Failed';
+          setMediaItems(prev => prev.map(item => item.id === video.id ? { ...item, status: 'error', error: message } : item));
         }
       }
     } catch (err) {
@@ -647,12 +653,20 @@ function App() {
           </span>
           
           {item.status === 'analyzing' && <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#9ca3af', fontSize: '12px' }}><Loader2 className="spinner" size={14} /> Analyzing</div>}
-          {item.status === 'error' && <span style={{ color: '#f87171', fontSize: '12px', fontWeight: 'bold' }}>Error</span>}
+          {item.status === 'error' && <span style={{ color: '#f87171', fontSize: '12px', fontWeight: 'bold' }}>{item.error || 'Error'}</span>}
         </div>
 
         <div style={{ borderRadius: '8px', overflow: 'hidden', background: '#000', display: 'flex', justifyContent: 'center', alignItems: 'center', aspectRatio: '16/9' }}>
           {item.isVideo ? (
-            <video src={item.annotated_url || item.previewUrl} controls className="preview-image" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+            <video
+              key={item.annotated_url || item.previewUrl}
+              src={item.annotated_url || item.previewUrl}
+              controls
+              playsInline
+              preload="metadata"
+              className="preview-image"
+              style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
+            />
           ) : (
             <img src={item.annotated_url || item.previewUrl} className="preview-image" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
           )}
@@ -886,7 +900,7 @@ function App() {
               </div>
 
               {mediaItems.length === 0 ? (
-                <div className="dropzone" onDragOver={handleDragOver} onDrop={handleDrop} onClick={() => fileInputRef.current?.click()} style={{ minHeight: '200px' }}>
+                <div className="dropzone" onDragOver={handleDragOver} onDrop={handleDrop} onClick={() => fileInputRef.current?.click()}>
                   <div className="dropzone-content">
                     <div className="icon-wrapper"><UploadCloud size={48} className="upload-icon" /></div>
                     <h3>Drop images & videos here</h3>
@@ -1009,14 +1023,15 @@ function App() {
                         </div>
                         <div style={{ display: 'flex', flexDirection: 'column', maxHeight: '400px', overflowY: 'auto', paddingRight: '4px' }}>
                           {file.items.map(item => {
-                            const invRec = inventory.find(i => i.object_code === item.object_code) || {
+                            const invRec = inventory.find(i => i.object_code === item.object_code);
+                            return renderInventoryRecord({
                               object_code: item.object_code,
-                              total_boxes: 0,
-                              total_pallets: 0,
-                              scan_count: 0,
-                              expected_qty: item.expected_qty
-                            };
-                            return renderInventoryRecord(invRec, file.id);
+                              total_boxes: invRec?.total_boxes ?? 0,
+                              total_pallets: invRec?.total_pallets ?? 0,
+                              scan_count: invRec?.scan_count ?? 0,
+                              // Always show THIS ERP file's expected qty
+                              expected_qty: item.expected_qty,
+                            }, file.id);
                           })}
                         </div>
                       </div>
