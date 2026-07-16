@@ -41,10 +41,11 @@ app.add_middleware(
     expose_headers=["X-Box-Count", "X-Pallet-Count", "X-Is-Duplicate"],
 )
 
-os.makedirs("uploads", exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
-DB_PATH = "inventory.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -109,6 +110,78 @@ def init_db():
                 expected_qty INTEGER
             )
         ''')
+
+    # Permanent per-ERP expected qtys from upload. Survives drag/move between ERPs.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS erp_catalog (
+            csv_id INTEGER NOT NULL,
+            object_code TEXT NOT NULL,
+            expected_qty INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (csv_id, object_code)
+        )
+    ''')
+    # Seed catalog from current erp_data for existing DBs
+    c.execute('''
+        INSERT OR IGNORE INTO erp_catalog (csv_id, object_code, expected_qty)
+        SELECT csv_id, object_code, expected_qty FROM erp_data
+    ''')
+    # If an active erp_data row has a real qty and catalog is 0, prefer the real qty
+    c.execute('''
+        UPDATE erp_catalog
+        SET expected_qty = (
+            SELECT e.expected_qty FROM erp_data e
+            WHERE e.csv_id = erp_catalog.csv_id AND e.object_code = erp_catalog.object_code
+        )
+        WHERE expected_qty = 0
+          AND EXISTS (
+            SELECT 1 FROM erp_data e
+            WHERE e.csv_id = erp_catalog.csv_id
+              AND e.object_code = erp_catalog.object_code
+              AND e.expected_qty > 0
+          )
+    ''')
+
+    # Refresh catalog (+ active rows) from original CSV files still on disk
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for csv_row in c.execute('SELECT id, filename FROM csv_files').fetchall():
+        csv_id, filename = csv_row
+        if not filename:
+            continue
+        path = os.path.join(base_dir, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    sku = None
+                    qty = 0
+                    for k, v in row.items():
+                        if not k or v is None:
+                            continue
+                        kl = k.lower().strip()
+                        if 'sku' in kl or 'object' in kl or 'item' in kl or 'code' in kl:
+                            if not sku:
+                                sku = str(v).strip()
+                        if 'qty' in kl or 'quant' in kl or 'expected' in kl:
+                            try:
+                                qty = int(str(v).strip())
+                            except Exception:
+                                pass
+                    if not sku:
+                        continue
+                    c.execute(
+                        '''INSERT INTO erp_catalog (csv_id, object_code, expected_qty)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT(csv_id, object_code) DO UPDATE SET expected_qty=excluded.expected_qty''',
+                        (csv_id, sku, qty),
+                    )
+                    c.execute(
+                        'UPDATE erp_data SET expected_qty = ? WHERE csv_id = ? AND object_code = ?',
+                        (qty, csv_id, sku),
+                    )
+        except Exception as e:
+            print(f"Catalog repair skipped for {filename}: {e}")
 
     # Add file_path if it doesn't exist (for existing DB)
     try:
@@ -273,7 +346,16 @@ async def upload_erp(file: UploadFile = File(...)):
                 except:
                     pass
         if sku:
-            c.execute('INSERT INTO erp_data (csv_id, object_code, expected_qty) VALUES (?, ?, ?)', (csv_id, sku, qty))
+            c.execute(
+                'INSERT INTO erp_data (csv_id, object_code, expected_qty) VALUES (?, ?, ?)',
+                (csv_id, sku, qty),
+            )
+            c.execute(
+                '''INSERT INTO erp_catalog (csv_id, object_code, expected_qty)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(csv_id, object_code) DO UPDATE SET expected_qty=excluded.expected_qty''',
+                (csv_id, sku, qty),
+            )
     
     conn.commit()
     conn.close()
@@ -288,7 +370,15 @@ def get_erp_files():
     files = [dict(row) for row in c.fetchall()]
     
     for file in files:
-        c.execute('SELECT object_code, expected_qty FROM erp_data WHERE csv_id = ?', (file['id'],))
+        c.execute(
+            '''SELECT e.object_code,
+                      COALESCE(cat.expected_qty, e.expected_qty) AS expected_qty
+               FROM erp_data e
+               LEFT JOIN erp_catalog cat
+                 ON cat.csv_id = e.csv_id AND cat.object_code = e.object_code
+               WHERE e.csv_id = ?''',
+            (file['id'],),
+        )
         file['items'] = [dict(row) for row in c.fetchall()]
         
     conn.close()
@@ -302,18 +392,30 @@ class AddErpItemRequest(BaseModel):
 def add_erp_item(csv_id: int, req: AddErpItemRequest):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Expected qty always comes from THIS ERP's catalog (uploaded CSV).
+    # If the class was never in this ERP, qty is 0 — never borrow from another ERP.
+    c.execute(
+        'SELECT expected_qty FROM erp_catalog WHERE csv_id = ? AND object_code = ?',
+        (csv_id, req.object_code),
+    )
+    catalog_row = c.fetchone()
+    expected_qty = catalog_row[0] if catalog_row is not None else 0
+
     c.execute('DELETE FROM erp_data WHERE object_code = ?', (req.object_code,))
-    c.execute('INSERT INTO erp_data (csv_id, object_code, expected_qty) VALUES (?, ?, ?)', 
-              (csv_id, req.object_code, req.expected_qty))
+    c.execute(
+        'INSERT INTO erp_data (csv_id, object_code, expected_qty) VALUES (?, ?, ?)',
+        (csv_id, req.object_code, expected_qty),
+    )
     conn.commit()
     conn.close()
-    return {"status": "success"}
+    return {"status": "success", "expected_qty": expected_qty}
 
 @app.delete("/erp/files/{csv_id}/items/{object_code}")
 def delete_erp_item(csv_id: int, object_code: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM erp_data WHERE csv_id = ? AND object_code = ?', (csv_id, object_code))
+    c.execute('DELETE FROM erp_catalog WHERE csv_id = ? AND object_code = ?', (csv_id, object_code))
     conn.commit()
     conn.close()
     return {"status": "success"}
@@ -323,6 +425,7 @@ def delete_erp_file(csv_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM erp_data WHERE csv_id = ?', (csv_id,))
+    c.execute('DELETE FROM erp_catalog WHERE csv_id = ?', (csv_id,))
     c.execute('DELETE FROM csv_files WHERE id = ?', (csv_id,))
     conn.commit()
     conn.close()
@@ -342,9 +445,9 @@ def merge_inventory_class(req: MergeRequest):
     conn.close()
     return {"status": "success"}
 
-# Load the YOLO model (83-epoch Large model)
+# Load the fine-tuned inventory model (box + pallet classes)
 MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), 
+    os.path.dirname(os.path.dirname(__file__)),
     "runs", "train_results_yolo11l", "weights", "best.pt"
 )
 
@@ -810,8 +913,9 @@ async def analyze_batch(
         annotated_img_array = result.plot()
         annotated_img_pil = Image.fromarray(annotated_img_array[..., ::-1])
         
-        file_path = f"uploads/{uuid.uuid4().hex}.jpg"
-        annotated_img_pil.save(file_path, format="JPEG")
+        file_name = f"{uuid.uuid4().hex}.jpg"
+        file_path = f"uploads/{file_name}"
+        annotated_img_pil.save(os.path.join(UPLOADS_DIR, file_name), format="JPEG")
         url = f"http://localhost:8000/{file_path}"
         
         scan_id = None
@@ -835,10 +939,69 @@ async def analyze_batch(
 
 def remove_file(path: str):
     try:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             os.unlink(path)
     except Exception as e:
         print(f"Error removing temp file {path}: {e}")
+
+def create_video_writer(output_path: str, fps: float, width: int, height: int):
+    """OpenCV codec support varies on Windows; try common fallbacks."""
+    if not fps or fps <= 0 or fps != fps:
+        fps = 25.0
+
+    # H.264 / yuv420p requires even frame dimensions
+    width = max(2, int(width) - (int(width) % 2))
+    height = max(2, int(height) - (int(height) % 2))
+
+    base, _ = os.path.splitext(output_path)
+    candidates = [
+        (output_path, "mp4v"),
+        (output_path, "avc1"),
+        (f"{base}.avi", "XVID"),
+        (f"{base}.avi", "MJPG"),
+    ]
+    for path, fourcc_str in candidates:
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
+        if writer.isOpened():
+            return writer, path, width, height
+        writer.release()
+    return None, None, width, height
+
+def transcode_video_for_browser(src_path: str) -> str:
+    """Re-encode to H.264 MP4 so Chrome/Edge/Firefox can play the result."""
+    try:
+        import subprocess
+        import imageio_ffmpeg
+    except ImportError as e:
+        print(f"Browser video transcode unavailable ({e}). Install imageio-ffmpeg.")
+        return src_path
+
+    base, _ = os.path.splitext(src_path)
+    dst_path = f"{base}_browser.mp4"
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-y", "-i", src_path,
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-an",
+        dst_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(dst_path) or os.path.getsize(dst_path) == 0:
+        print(f"ffmpeg transcode failed: {(result.stderr or '')[-800:]}")
+        remove_file(dst_path)
+        return src_path
+
+    remove_file(src_path)
+    final_path = f"{base}.mp4"
+    if os.path.abspath(dst_path) != os.path.abspath(final_path):
+        if os.path.exists(final_path):
+            remove_file(final_path)
+        os.replace(dst_path, final_path)
+        return final_path
+    return dst_path
 
 @app.post("/analyze_video")
 async def analyze_video(
@@ -894,9 +1057,15 @@ async def analyze_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
-    out = cv2.VideoWriter(temp_output_path, fourcc, fps, (width, height))
+
+    out, temp_output_path, width, height = create_video_writer(temp_output_path, fps, width, height)
+    if out is None:
+        cap.release()
+        remove_file(temp_input.name)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Could not initialize video encoder on this system."},
+        )
     
     unique_boxes = set()
     unique_pallets = set()
@@ -912,7 +1081,7 @@ async def analyze_video(
         frame_count += 1
         
         if frame_count % 2 == 1:
-            results = model.track(frame, tracker="bytetrack.yaml", persist=True, augment=True, conf=0.20, iou=0.25, imgsz=1024, max_det=1000, verbose=False)
+            results = model.track(frame, tracker="bytetrack.yaml", persist=True, augment=True, conf=0.20, iou=0.25, imgsz=1024, max_det=1000, verbose=True)
             result = results[0]
             annotated_frame = result.plot()
             last_annotated = annotated_frame
@@ -929,6 +1098,9 @@ async def analyze_video(
                         unique_pallets.add(obj_id)
         else:
             annotated_frame = last_annotated if last_annotated is not None else frame
+
+        if annotated_frame.shape[1] != width or annotated_frame.shape[0] != height:
+            annotated_frame = cv2.resize(annotated_frame, (width, height))
                     
         count_text = f"Total Boxes: {len(unique_boxes)} | Total Pallets: {len(unique_pallets)}"
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -945,9 +1117,21 @@ async def analyze_video(
         
     cap.release()
     out.release()
-    
-    final_output_path = f"uploads/{uuid.uuid4().hex}.mp4"
-    shutil.move(temp_output_path, final_output_path)
+
+    if not os.path.exists(temp_output_path) or os.path.getsize(temp_output_path) == 0:
+        remove_file(temp_input.name)
+        remove_file(temp_output_path)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Annotated video could not be saved. Try a shorter clip or different format."},
+        )
+
+    # OpenCV often writes mp4v/FMP4 which browsers cannot play — re-encode to H.264
+    temp_output_path = transcode_video_for_browser(temp_output_path)
+
+    file_name = f"{uuid.uuid4().hex}.mp4"
+    final_output_path = f"uploads/{file_name}"
+    shutil.move(temp_output_path, os.path.join(UPLOADS_DIR, file_name))
     
     remove_file(temp_input.name)
     
